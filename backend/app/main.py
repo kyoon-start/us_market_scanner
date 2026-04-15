@@ -11,7 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
-from .config import get_default_symbols
+from .config import get_default_symbols, normalize_universe_size
 from .ranking import rank_recommendations
 from .stocks import InvalidSymbolError, StockNotFoundError, get_stock_detail
 
@@ -122,13 +122,26 @@ def get_recommendations(
         list[str] | None,
         Query(description="Optional repeated query param, for example ?symbols=AAPL&symbols=MSFT"),
     ] = None,
+    universe_size: Annotated[
+        int | None,
+        Query(description="Optional default universe size when symbols are omitted: 100, 300, or 1000"),
+    ] = None,
 ) -> JSONResponse:
     """Return the top ranked swing and long-term stock ideas."""
-    selected_symbols = symbols or get_default_symbols()
-    logger.info("/recommendations scanning %d symbols", len(selected_symbols))
+    normalized_universe_size = normalize_universe_size(universe_size)
+    selected_symbols = symbols or get_default_symbols(normalized_universe_size)
+    logger.info(
+        "/recommendations scanning %d symbols (explicit_symbols=%s, universe_size=%d)",
+        len(selected_symbols),
+        bool(symbols),
+        normalized_universe_size,
+    )
 
     start_time = time.perf_counter()
-    recommendations = rank_recommendations(selected_symbols)
+    recommendations = rank_recommendations(
+        selected_symbols,
+        universe_size=normalized_universe_size,
+    )
     elapsed_seconds = time.perf_counter() - start_time
 
     logger.info("/recommendations completed in %.2f seconds", elapsed_seconds)

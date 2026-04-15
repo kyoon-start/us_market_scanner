@@ -74,45 +74,58 @@ def calculate_pattern_signal(dataframe: pd.DataFrame) -> dict[str, float | int |
     if len(close_series) < minimum_length:
         return {"score": 0, "probability": None, "matches": 0}
 
-    current_window = close_series.iloc[-PATTERN_LOOKBACK_DAYS:]
-    current_pattern = _normalize_pattern(current_window)
-    if current_pattern is None:
+    close_values = close_series.to_numpy(dtype=float)
+    if np.isnan(close_values).any():
         return {"score": 0, "probability": None, "matches": 0}
 
-    candidates: list[tuple[float, float]] = []
-    final_start = len(close_series) - PATTERN_LOOKBACK_DAYS - PATTERN_FORWARD_DAYS
+    returns = np.diff(close_values) / close_values[:-1]
+    pattern_width = PATTERN_LOOKBACK_DAYS - 1
+    final_start = len(close_values) - PATTERN_LOOKBACK_DAYS - PATTERN_FORWARD_DAYS
+    if final_start <= 0 or returns.size < pattern_width:
+        return {"score": 0, "probability": None, "matches": 0}
 
-    for start_index in range(final_start):
-        historical_window = close_series.iloc[start_index : start_index + PATTERN_LOOKBACK_DAYS]
-        forward_window = close_series.iloc[
-            start_index + PATTERN_LOOKBACK_DAYS : start_index + PATTERN_LOOKBACK_DAYS + PATTERN_FORWARD_DAYS
-        ]
+    return_windows = np.lib.stride_tricks.sliding_window_view(returns, pattern_width)
+    current_pattern = return_windows[-1].astype(float, copy=True)
+    current_norm = np.linalg.norm(current_pattern)
+    if not np.isfinite(current_norm):
+        return {"score": 0, "probability": None, "matches": 0}
+    if current_norm != 0:
+        current_pattern = current_pattern / current_norm
 
-        if len(historical_window) < PATTERN_LOOKBACK_DAYS or len(forward_window) < PATTERN_FORWARD_DAYS:
-            continue
+    candidate_patterns = return_windows[:final_start].astype(float, copy=True)
+    candidate_norms = np.linalg.norm(candidate_patterns, axis=1)
+    finite_mask = np.isfinite(candidate_norms)
+    if not finite_mask.any():
+        return {"score": 0, "probability": None, "matches": 0}
 
-        historical_pattern = _normalize_pattern(historical_window)
-        if historical_pattern is None or historical_pattern.shape != current_pattern.shape:
-            continue
+    nonzero_mask = finite_mask & (candidate_norms != 0)
+    candidate_patterns[nonzero_mask] = candidate_patterns[nonzero_mask] / candidate_norms[nonzero_mask, None]
+    candidate_patterns[finite_mask & (candidate_norms == 0)] = 0.0
 
-        similarity = float(np.dot(current_pattern, historical_pattern))
-        if not np.isfinite(similarity):
-            continue
+    similarities = candidate_patterns @ current_pattern
+    valid_similarity_mask = np.isfinite(similarities)
+    if not valid_similarity_mask.any():
+        return {"score": 0, "probability": None, "matches": 0}
 
-        base_close = historical_window.iloc[-1]
-        future_close = forward_window.iloc[-1]
-        if pd.isna(base_close) or pd.isna(future_close) or base_close == 0:
-            continue
+    base_close = close_values[PATTERN_LOOKBACK_DAYS - 1 : PATTERN_LOOKBACK_DAYS - 1 + final_start]
+    future_close = close_values[
+        PATTERN_LOOKBACK_DAYS + PATTERN_FORWARD_DAYS - 1 :
+        PATTERN_LOOKBACK_DAYS + PATTERN_FORWARD_DAYS - 1 + final_start
+    ]
+    valid_price_mask = np.isfinite(base_close) & np.isfinite(future_close) & (base_close != 0)
+    valid_mask = valid_similarity_mask & valid_price_mask
+    valid_count = int(valid_mask.sum())
+    if valid_count < PATTERN_MIN_MATCHES:
+        return {"score": 0, "probability": None, "matches": valid_count}
 
-        forward_return = float((future_close / base_close) - 1.0)
-        candidates.append((similarity, forward_return))
+    valid_similarities = similarities[valid_mask]
+    valid_forward_returns = (future_close[valid_mask] / base_close[valid_mask]) - 1.0
 
-    if len(candidates) < PATTERN_MIN_MATCHES:
-        return {"score": 0, "probability": None, "matches": len(candidates)}
+    top_match_count = min(PATTERN_TOP_MATCHES, valid_count)
+    top_indices = np.argpartition(valid_similarities, -top_match_count)[-top_match_count:]
+    top_forward_returns = valid_forward_returns[top_indices]
 
-    top_matches = sorted(candidates, key=lambda item: item[0], reverse=True)[:PATTERN_TOP_MATCHES]
-    forward_returns = [forward_return for _, forward_return in top_matches]
-    probability = sum(return_value > 0 for return_value in forward_returns) / len(forward_returns)
+    probability = float(np.mean(top_forward_returns > 0))
 
     pattern_score = int(round((probability - 0.5) * 40))
     pattern_score = max(-20, min(20, pattern_score))
@@ -120,7 +133,7 @@ def calculate_pattern_signal(dataframe: pd.DataFrame) -> dict[str, float | int |
     return {
         "score": pattern_score,
         "probability": probability,
-        "matches": len(top_matches),
+        "matches": top_match_count,
     }
 
 
@@ -195,10 +208,14 @@ def score_swing_setup(
     breakout_clean = breakout_above_recent_high and _has_value(distance_recent_high) and distance_recent_high <= 0.02
     breakout_tight = (not breakout_above_recent_high) and breakout_attempt and _has_value(distance_recent_high)
     strong_volume = _has_value(volume_ratio) and volume_ratio >= 1.8
-    weak_volume = _has_value(volume_ratio) and volume_ratio < 0.9
+    confirmed_volume = _has_value(volume_ratio) and volume_ratio >= 1.0
+    weak_volume = _has_value(volume_ratio) and volume_ratio < 0.85
+    very_weak_volume = _has_value(volume_ratio) and volume_ratio < 0.65
     healthy_short_return = _has_value(return_5d) and 0.02 <= return_5d <= 0.12
-    healthy_month_return = _has_value(return_20d) and return_20d >= 0.07
+    healthy_month_return = _has_value(return_20d) and 0.07 <= return_20d <= 0.16
     flat_month_return = _has_value(return_20d) and return_20d < 0.03
+    extended_month_return = _has_value(return_20d) and return_20d > 0.16
+    very_extended_month_return = _has_value(return_20d) and return_20d > 0.25
     near_52week_high = _has_value(position_vs_52week_high) and position_vs_52week_high >= 0.93
     far_from_52week_high = _has_value(position_vs_52week_high) and position_vs_52week_high < 0.78
     controlled_atr = _has_value(atr_percent) and atr_percent <= 0.05
@@ -206,10 +223,11 @@ def score_swing_setup(
     rsi_constructive = _has_value(rsi) and 48 <= rsi <= 66
     overbought = _has_value(rsi) and rsi > 72
     elevated_volatility = _has_value(volatility_20) and volatility_20 > 0.45
+    confirmed_trend_stack = trend_stack and confirmed_volume and not overbought and not very_extended_month_return
 
     score = _apply_score(score, reasons, price_above_ma20, 8, f"Price closed at {_format_number(close_price)}, above MA20 {_format_number(ma20)}")
     score = _apply_score(score, reasons, medium_term_support, 8, f"Price is also holding above MA60 {_format_number(ma60)}, supporting the medium-term trend")
-    score = _apply_score(score, reasons, trend_stack, 14, f"Moving averages are cleanly aligned with price > MA20 {_format_number(ma20)} > MA60 {_format_number(ma60)} > MA120 {_format_number(ma120)}")
+    score = _apply_score(score, reasons, confirmed_trend_stack, 14, f"Moving averages are cleanly aligned with price > MA20 {_format_number(ma20)} > MA60 {_format_number(ma60)} > MA120 {_format_number(ma120)}, with participation confirming the trend")
     score = _apply_score(score, reasons, breakout_clean, 14, f"Price cleared the recent 20-day high of {_format_number(recent_high_20)} and remains {_format_percent(distance_recent_high)} above that level")
     score = _apply_score(score, reasons, breakout_tight, 8, f"Price is tightly coiled within {_format_percent(distance_recent_high)} of the recent 20-day high {_format_number(recent_high_20)}")
     score = _apply_score(score, reasons, strong_volume, 14, f"Volume expanded to {_format_number(volume)} versus the 20-day average {_format_number(volume_average)} ({_format_number(volume_ratio)}x), showing strong participation")
@@ -219,9 +237,12 @@ def score_swing_setup(
     score = _apply_score(score, reasons, controlled_atr, 4, f"ATR is {_format_percent(atr_percent)} of price, keeping swing volatility controlled")
     score = _apply_score(score, reasons, rsi_constructive, 5, f"RSI is {_format_number(rsi)}, which supports upside momentum without looking overheated")
 
-    score = _apply_score(score, reasons, weak_volume, -10, f"Volume is only {_format_number(volume_ratio)}x the 20-day average, which weakens conviction")
+    score = _apply_score(score, reasons, weak_volume, -14, f"Volume is only {_format_number(volume_ratio)}x the 20-day average, which weakens conviction")
+    score = _apply_score(score, reasons, very_weak_volume, -10, f"Volume is severely below normal at {_format_number(volume_ratio)}x the 20-day average, making the setup lower quality")
     score = _apply_score(score, reasons, overbought, -12, f"RSI reached {_format_number(rsi)}, which looks overextended for a fresh swing entry")
     score = _apply_score(score, reasons, recent_spike, -12, f"The 5-day return already reached {_format_percent(return_5d)}, increasing chase risk after a sharp run")
+    score = _apply_score(score, reasons, extended_month_return, -12, f"The 20-day return is already {_format_percent(return_20d)}, reducing ranking quality because the stock is extended")
+    score = _apply_score(score, reasons, very_extended_month_return, -8, f"The stock is far extended over 20 days at {_format_percent(return_20d)}, adding pullback risk")
     score = _apply_score(score, reasons, flat_month_return, -8, f"The 20-day return is only {_format_percent(return_20d)}, leaving the setup too neutral to stand out")
     score = _apply_score(score, reasons, noisy_atr, -8, f"ATR is {_format_percent(atr_percent)} of price, making the setup noisier than preferred")
     score = _apply_score(score, reasons, elevated_volatility, -8, f"20-day realized volatility is {_format_percent(volatility_20)}, which reduces swing quality")
@@ -266,36 +287,47 @@ def score_long_term_setup(
     )
     strong_trend_slope = _has_value(trend_strength_20) and trend_strength_20 >= 0.03
     weak_trend_slope = _has_value(trend_strength_20) and trend_strength_20 < 0.015
-    sustained_return = _has_value(return_20d) and return_20d >= 0.12
+    sustained_return = _has_value(return_20d) and 0.06 <= return_20d <= 0.12
     weak_long_return = _has_value(return_20d) and return_20d < 0.04
     strong_volume = _has_value(volume_ratio) and volume_ratio >= 1.4
-    weak_volume = _has_value(volume_ratio) and volume_ratio < 0.95
+    confirmed_volume = _has_value(volume_ratio) and volume_ratio >= 1.0
+    weak_volume = _has_value(volume_ratio) and volume_ratio < 0.9
+    very_weak_volume = _has_value(volume_ratio) and volume_ratio < 0.7
     near_52week_high = _has_value(position_vs_52week_high) and position_vs_52week_high >= 0.93
     far_from_52week_high = _has_value(position_vs_52week_high) and position_vs_52week_high < 0.8
     contained_volatility = _has_value(atr_percent) and atr_percent <= 0.06
     noisy_volatility = _has_value(atr_percent) and atr_percent > 0.08
     overextended_rsi = _has_value(rsi) and rsi > 70
-    overextended_run = _has_value(return_20d) and return_20d > 0.13
+    overextended_run = _has_value(return_20d) and return_20d > 0.10
+    far_extended_run = _has_value(return_20d) and return_20d > 0.18
     misaligned_mas = _has_value(ma20) and _has_value(ma60) and _has_value(ma120) and not (ma20 > ma60 > ma120)
+    confirmed_clean_trend_stack = (
+        clean_trend_stack
+        and confirmed_volume
+        and not far_extended_run
+        and not noisy_volatility
+    )
 
     score = _apply_score(score, reasons, price_above_ma60, 6, f"Price closed at {_format_number(close_price)}, holding above MA60 {_format_number(ma60)}")
     score = _apply_score(score, reasons, price_above_ma120, 8, f"Price remains above MA120 {_format_number(ma120)}, preserving the primary uptrend")
     score = _apply_score(score, reasons, ma60_trending_up, 6, f"MA60 improved from {_format_number(ma60_prior)} to {_format_number(ma60)} over the last week")
-    score = _apply_score(score, reasons, clean_trend_stack, 14, f"Moving averages are cleanly stacked with price > MA20 {_format_number(ma20)} > MA60 {_format_number(ma60)} > MA120 {_format_number(ma120)}")
+    score = _apply_score(score, reasons, confirmed_clean_trend_stack, 14, f"Moving averages are cleanly stacked with price > MA20 {_format_number(ma20)} > MA60 {_format_number(ma60)} > MA120 {_format_number(ma120)}, with volume and risk confirming the trend")
     score = _apply_score(score, reasons, strong_trend_slope, 8, f"MA20 has improved by {_format_percent(trend_strength_20)} over the last month, indicating a durable trend slope")
     score = _apply_score(score, reasons, sustained_return, 8, f"The stock gained {_format_percent(return_20d)} over 20 days, confirming persistent demand")
     score = _apply_score(score, reasons, near_52week_high, 8, f"Price is at {_format_percent(position_vs_52week_high)} of its 52-week high, showing it remains near leadership levels")
     score = _apply_score(score, reasons, strong_volume, 5, f"Volume is running at {_format_number(volume_ratio)}x the 20-day average, supporting the longer-term move")
     score = _apply_score(score, reasons, contained_volatility, 4, f"ATR is {_format_percent(atr_percent)} of price, indicating the trend is relatively orderly")
 
-    score = _apply_score(score, reasons, weak_volume, -12, f"Volume is only {_format_number(volume_ratio)}x the 20-day average, which is too weak for a higher-conviction trend setup")
+    score = _apply_score(score, reasons, weak_volume, -18, f"Volume is only {_format_number(volume_ratio)}x the 20-day average, which is too weak for a higher-conviction trend setup")
+    score = _apply_score(score, reasons, very_weak_volume, -12, f"Volume is severely below normal at {_format_number(volume_ratio)}x the 20-day average, so the trend lacks participation")
     score = _apply_score(score, reasons, weak_long_return, -12, f"The 20-day return is only {_format_percent(return_20d)}, leaving the long-term trend case too neutral")
     score = _apply_score(score, reasons, weak_trend_slope, -10, f"MA20 has improved by just {_format_percent(trend_strength_20)}, which is too flat for a strong long-term trend")
     score = _apply_score(score, reasons, misaligned_mas, -12, f"Moving-average alignment is not clean enough because MA20 {_format_number(ma20)}, MA60 {_format_number(ma60)}, and MA120 {_format_number(ma120)} are not stacked cleanly")
     score = _apply_score(score, reasons, noisy_volatility, -10, f"ATR is {_format_percent(atr_percent)} of price, which makes the longer-term setup too noisy")
     score = _apply_score(score, reasons, far_from_52week_high, -10, f"Price is only at {_format_percent(position_vs_52week_high)} of its 52-week high, limiting leadership quality")
     score = _apply_score(score, reasons, overextended_rsi, -10, f"RSI reached {_format_number(rsi)}, which is too extended for a conservative long-term entry")
-    score = _apply_score(score, reasons, overextended_run, -10, f"The 20-day return is already {_format_percent(return_20d)}, which raises mean-reversion risk for a conservative long-term setup")
+    score = _apply_score(score, reasons, overextended_run, -18, f"The 20-day return is already {_format_percent(return_20d)}, which raises mean-reversion risk for a conservative long-term setup")
+    score = _apply_score(score, reasons, far_extended_run, -12, f"The stock is far extended over 20 days at {_format_percent(return_20d)}, so the long-term entry needs a pullback or base")
 
     score, pattern_probability = _append_pattern_reason(score, reasons, pattern_signal, context_label="trend", weight=LONG_PATTERN_WEIGHT)
 

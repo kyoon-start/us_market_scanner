@@ -5,8 +5,29 @@ from __future__ import annotations
 import numpy as np
 import pandas as pd
 
+from .cache import TTLCache
+from .scanner_config import INDICATOR_CACHE_TTL_SECONDS
+
 
 TRADING_DAYS_IN_YEAR = 252
+
+_INDICATOR_CACHE: TTLCache[pd.DataFrame] = TTLCache()
+
+
+def _frame_fingerprint(dataframe: pd.DataFrame) -> tuple[int, str, float | None, float | None]:
+    """Create a lightweight cache fingerprint for an OHLCV dataframe."""
+    if dataframe.empty:
+        return (0, "", None, None)
+
+    last_index = dataframe.index[-1]
+    last_close = dataframe["Close"].iloc[-1] if "Close" in dataframe.columns else None
+    last_volume = dataframe["Volume"].iloc[-1] if "Volume" in dataframe.columns else None
+    return (
+        len(dataframe),
+        str(last_index),
+        None if pd.isna(last_close) else round(float(last_close), 6),
+        None if pd.isna(last_volume) else round(float(last_volume), 2),
+    )
 
 
 def calculate_rsi(close_series: pd.Series, period: int = 14) -> pd.Series:
@@ -45,38 +66,50 @@ def add_indicators(dataframe: pd.DataFrame) -> pd.DataFrame:
     if dataframe.empty:
         return dataframe.copy()
 
+    cache_key = ("indicators", *_frame_fingerprint(dataframe))
+    cached = _INDICATOR_CACHE.get(cache_key)
+    if cached is not None:
+        return cached.copy()
+
     frame = dataframe.copy()
+    close = frame["Close"]
+    high = frame["High"]
+    volume = frame["Volume"]
+    zero_safe_close = close.replace(0, np.nan)
 
-    frame["MA20"] = frame["Close"].rolling(window=20, min_periods=20).mean()
-    frame["MA60"] = frame["Close"].rolling(window=60, min_periods=60).mean()
-    frame["MA120"] = frame["Close"].rolling(window=120, min_periods=120).mean()
-    frame["MA60Prior"] = frame["MA60"].shift(5)
-    frame["RSI"] = calculate_rsi(frame["Close"])
-    frame["ATR14"] = calculate_atr(frame, period=14)
-    frame["ATRPercent"] = frame["ATR14"] / frame["Close"].replace(0, np.nan)
-    frame["VolumeAverage20"] = frame["Volume"].rolling(window=20, min_periods=20).mean()
-    frame["VolumeRatio"] = frame["Volume"] / frame["VolumeAverage20"].replace(0, np.nan)
+    ma20 = close.rolling(window=20, min_periods=20).mean()
+    ma60 = close.rolling(window=60, min_periods=60).mean()
+    ma120 = close.rolling(window=120, min_periods=120).mean()
+    atr14 = calculate_atr(frame, period=14)
+    volume_average_20 = volume.rolling(window=20, min_periods=20).mean()
+    daily_returns = close.pct_change()
+    recent_high_20 = high.rolling(window=20, min_periods=20).max().shift(1)
+    high_52_week = high.rolling(window=TRADING_DAYS_IN_YEAR, min_periods=TRADING_DAYS_IN_YEAR).max()
 
-    frame["Return5D"] = frame["Close"].pct_change(periods=5)
-    frame["Return20D"] = frame["Close"].pct_change(periods=20)
-    daily_returns = frame["Close"].pct_change()
+    frame["MA20"] = ma20
+    frame["MA60"] = ma60
+    frame["MA120"] = ma120
+    frame["MA60Prior"] = ma60.shift(5)
+    frame["RSI"] = calculate_rsi(close)
+    frame["ATR14"] = atr14
+    frame["ATRPercent"] = atr14 / zero_safe_close
+    frame["VolumeAverage20"] = volume_average_20
+    frame["VolumeRatio"] = volume / volume_average_20.replace(0, np.nan)
+
+    frame["Return5D"] = close.pct_change(periods=5)
+    frame["Return20D"] = close.pct_change(periods=20)
     frame["Volatility20"] = daily_returns.rolling(window=20, min_periods=20).std() * np.sqrt(TRADING_DAYS_IN_YEAR)
 
-    frame["RecentHigh20"] = frame["High"].rolling(window=20, min_periods=20).max().shift(1)
-    frame["DistanceFromRecentHigh20"] = (
-        frame["Close"] / frame["RecentHigh20"].replace(0, np.nan)
-    ) - 1.0
-    frame["BreakoutAboveRecentHigh"] = (
-        frame["Close"] > frame["RecentHigh20"]
-    ) & frame["RecentHigh20"].notna()
+    frame["RecentHigh20"] = recent_high_20
+    frame["DistanceFromRecentHigh20"] = (close / recent_high_20.replace(0, np.nan)) - 1.0
+    frame["BreakoutAboveRecentHigh"] = (close > recent_high_20) & recent_high_20.notna()
     frame["BreakoutAttempt"] = (
-        frame["DistanceFromRecentHigh20"] >= -0.02
-    ) & (
-        frame["DistanceFromRecentHigh20"] <= 0.03
-    ) & frame["RecentHigh20"].notna()
+        frame["DistanceFromRecentHigh20"].between(-0.02, 0.03, inclusive="both")
+        & recent_high_20.notna()
+    )
 
-    frame["High52Week"] = frame["High"].rolling(window=TRADING_DAYS_IN_YEAR, min_periods=TRADING_DAYS_IN_YEAR).max()
-    frame["PositionVs52WeekHigh"] = frame["Close"] / frame["High52Week"].replace(0, np.nan)
+    frame["High52Week"] = high_52_week
+    frame["PositionVs52WeekHigh"] = close / high_52_week.replace(0, np.nan)
 
     frame["MA60TrendUp"] = frame["MA60"] > frame["MA60Prior"]
     frame["MAAlignmentBullish"] = (
@@ -87,7 +120,7 @@ def add_indicators(dataframe: pd.DataFrame) -> pd.DataFrame:
         & (frame["MA60"] > frame["MA120"])
     )
     frame["TrendStrength20"] = (frame["MA20"] / frame["MA20"].shift(20)) - 1.0
-
     frame["RecentSpike"] = frame["Return5D"] > 0.18
 
+    _INDICATOR_CACHE.set(cache_key, frame.copy(), INDICATOR_CACHE_TTL_SECONDS)
     return frame

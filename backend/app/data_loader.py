@@ -1,34 +1,53 @@
-﻿"""Utilities for fetching and normalizing market data."""
+"""Utilities for fetching and normalizing market data."""
 
 from __future__ import annotations
 
 import logging
-import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Iterable
 
 import pandas as pd
 import yfinance as yf
 
+from .cache import TTLCache
+from .scanner_config import (
+    DEFAULT_INTERVAL,
+    DEFAULT_PERIOD,
+    DOWNLOAD_CHUNK_SIZE,
+    DOWNLOAD_MAX_WORKERS,
+    DOWNLOAD_RETRY_SYMBOL_LIMIT,
+    FAILED_DATA_CACHE_TTL_SECONDS,
+    RAW_DATA_CACHE_TTL_SECONDS,
+)
+
 
 logger = logging.getLogger(__name__)
 
 REQUIRED_COLUMNS = ("Open", "High", "Low", "Close", "Volume")
-CACHE_TTL_SECONDS = 900
-FAILED_DOWNLOAD_CACHE_TTL_SECONDS = 120
+_DATA_CACHE: TTLCache[pd.DataFrame] = TTLCache()
 
 
 @dataclass(slots=True)
-class CacheEntry:
-    """In-memory cached market data entry."""
+class DownloadStats:
+    """Operational stats for one bulk market-data request."""
 
-    dataframe: pd.DataFrame
-    expires_at: float
+    requested: int
+    cache_hits: int
+    cache_misses: int
+    downloaded_successfully: int
+    skipped: int
 
 
-_CACHE_LOCK = threading.Lock()
-_DATA_CACHE: dict[tuple[str, str, str], CacheEntry] = {}
+@dataclass(slots=True)
+class BulkDownloadResult:
+    """Bulk market-data payload plus stats and timing info."""
+
+    data: dict[str, pd.DataFrame]
+    stats: DownloadStats
+    download_seconds: float
+    total_seconds: float
 
 
 def _cache_key(symbol: str, period: str, interval: str) -> tuple[str, str, str]:
@@ -38,16 +57,10 @@ def _cache_key(symbol: str, period: str, interval: str) -> tuple[str, str, str]:
 
 def _get_cached_data(symbol: str, period: str, interval: str) -> pd.DataFrame | None:
     """Return cached data when it is still fresh."""
-    key = _cache_key(symbol, period, interval)
-
-    with _CACHE_LOCK:
-        entry = _DATA_CACHE.get(key)
-        if entry is None:
-            return None
-        if entry.expires_at < time.time():
-            _DATA_CACHE.pop(key, None)
-            return None
-        return entry.dataframe.copy()
+    cached = _DATA_CACHE.get(_cache_key(symbol, period, interval))
+    if cached is None:
+        return None
+    return cached.copy()
 
 
 def _set_cached_data(
@@ -55,14 +68,14 @@ def _set_cached_data(
     period: str,
     interval: str,
     dataframe: pd.DataFrame,
-    ttl_seconds: int = CACHE_TTL_SECONDS,
+    ttl_seconds: int,
 ) -> None:
     """Store normalized data in the in-memory cache."""
-    key = _cache_key(symbol, period, interval)
-    expires_at = time.time() + ttl_seconds
-
-    with _CACHE_LOCK:
-        _DATA_CACHE[key] = CacheEntry(dataframe=dataframe.copy(), expires_at=expires_at)
+    _DATA_CACHE.set(
+        _cache_key(symbol, period, interval),
+        dataframe.copy(),
+        ttl_seconds,
+    )
 
 
 def _normalize_columns(dataframe: pd.DataFrame) -> pd.DataFrame:
@@ -124,7 +137,7 @@ def _extract_symbol_frame(
 def _download_batch(symbols: list[str], period: str, interval: str) -> pd.DataFrame:
     """Download one batch of symbols from yfinance."""
     return yf.download(
-        tickers=symbols,
+        tickers=" ".join(symbols),
         period=period,
         interval=interval,
         auto_adjust=True,
@@ -134,38 +147,81 @@ def _download_batch(symbols: list[str], period: str, interval: str) -> pd.DataFr
     )
 
 
+def _chunk_symbols(symbols: list[str], chunk_size: int) -> list[list[str]]:
+    """Split a symbol list into stable chunk sizes for bulk downloads."""
+    return [symbols[index : index + chunk_size] for index in range(0, len(symbols), chunk_size)]
+
+
+def _download_chunk(symbols: list[str], period: str, interval: str) -> dict[str, pd.DataFrame]:
+    """Download and normalize one chunk of symbols."""
+    downloaded_data = _download_batch(symbols, period, interval)
+    multiple_symbols = len(symbols) > 1
+    return {
+        symbol: _extract_symbol_frame(downloaded_data, symbol, multiple_symbols)
+        for symbol in symbols
+    }
+
+
 def _download_missing_symbols(
     missing_symbols: list[str],
     period: str,
     interval: str,
-) -> dict[str, pd.DataFrame]:
-    """Download uncached symbols, falling back to per-symbol requests on failure."""
+) -> tuple[dict[str, pd.DataFrame], float]:
+    """Download uncached symbols with chunking and limited individual retries."""
+    if not missing_symbols:
+        return {}, 0.0
+
+    download_start = time.perf_counter()
     downloaded_results: dict[str, pd.DataFrame] = {}
-    batch_start = time.perf_counter()
+    retry_symbols: list[str] = []
+    chunks = _chunk_symbols(missing_symbols, DOWNLOAD_CHUNK_SIZE)
 
-    try:
-        logger.info("Downloading market data for %d uncached symbols", len(missing_symbols))
-        downloaded_data = _download_batch(missing_symbols, period, interval)
-        multiple_symbols = len(missing_symbols) > 1
+    logger.info(
+        "Market data cache miss for %d symbols; downloading in %d chunk(s)",
+        len(missing_symbols),
+        len(chunks),
+    )
 
-        for symbol in missing_symbols:
-            downloaded_results[symbol] = _extract_symbol_frame(downloaded_data, symbol, multiple_symbols)
+    max_workers = min(DOWNLOAD_MAX_WORKERS, len(chunks))
+    if max_workers <= 1:
+        for chunk in chunks:
+            try:
+                downloaded_results.update(_download_chunk(chunk, period, interval))
+            except Exception:
+                logger.exception("Bulk download failed for chunk of %d symbols", len(chunk))
+                retry_symbols.extend(chunk)
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_map = {
+                executor.submit(_download_chunk, chunk, period, interval): chunk
+                for chunk in chunks
+            }
+            for future in as_completed(future_map):
+                chunk = future_map[future]
+                try:
+                    downloaded_results.update(future.result())
+                except Exception:
+                    logger.exception("Bulk download failed for chunk of %d symbols", len(chunk))
+                    retry_symbols.extend(chunk)
 
-        logger.info(
-            "Bulk market download completed in %.2f seconds for %d symbols",
-            time.perf_counter() - batch_start,
-            len(missing_symbols),
-        )
-        return downloaded_results
-    except Exception:
-        logger.exception("Bulk download failed after %.2f seconds, retrying symbols individually", time.perf_counter() - batch_start)
+    missing_after_bulk = [
+        symbol for symbol in missing_symbols
+        if downloaded_results.get(symbol, pd.DataFrame(columns=REQUIRED_COLUMNS)).empty
+    ]
+    for symbol in missing_after_bulk:
+        if symbol not in retry_symbols:
+            retry_symbols.append(symbol)
 
-    for symbol in missing_symbols:
+    retry_candidates = retry_symbols[:DOWNLOAD_RETRY_SYMBOL_LIMIT]
+    if retry_candidates:
+        logger.info("Retrying %d symbol(s) individually after bulk download gaps", len(retry_candidates))
+
+    for symbol in retry_candidates:
         symbol_start = time.perf_counter()
         try:
             single_symbol_data = _download_batch([symbol], period, interval)
             downloaded_results[symbol] = _extract_symbol_frame(single_symbol_data, symbol, multiple_symbols=False)
-            logger.info(
+            logger.debug(
                 "Downloaded symbol %s individually in %.2f seconds",
                 symbol,
                 time.perf_counter() - symbol_start,
@@ -174,19 +230,24 @@ def _download_missing_symbols(
             logger.exception("Failed downloading symbol %s", symbol)
             downloaded_results[symbol] = pd.DataFrame(columns=REQUIRED_COLUMNS)
 
-    return downloaded_results
+    return downloaded_results, time.perf_counter() - download_start
 
 
-def load_daily_stock_data_bulk(
+def load_daily_stock_data_bulk_with_stats(
     symbols: Iterable[str],
-    period: str = "1y",
-    interval: str = "1d",
-) -> dict[str, pd.DataFrame]:
+    period: str = DEFAULT_PERIOD,
+    interval: str = DEFAULT_INTERVAL,
+) -> BulkDownloadResult:
     """Fetch daily stock data for many symbols with caching and batch download."""
     request_start = time.perf_counter()
     sanitized_symbols = sanitize_symbols(symbols)
     if not sanitized_symbols:
-        return {}
+        return BulkDownloadResult(
+            data={},
+            stats=DownloadStats(0, 0, 0, 0, 0),
+            download_seconds=0.0,
+            total_seconds=0.0,
+        )
 
     results: dict[str, pd.DataFrame] = {}
     missing_symbols: list[str] = []
@@ -200,27 +261,67 @@ def load_daily_stock_data_bulk(
         else:
             missing_symbols.append(symbol)
 
-    if missing_symbols:
-        downloaded_results = _download_missing_symbols(missing_symbols, period, interval)
-        for symbol, symbol_frame in downloaded_results.items():
-            ttl_seconds = CACHE_TTL_SECONDS if not symbol_frame.empty else FAILED_DOWNLOAD_CACHE_TTL_SECONDS
-            _set_cached_data(symbol, period, interval, symbol_frame, ttl_seconds=ttl_seconds)
-            results[symbol] = symbol_frame
-
     logger.info(
-        "Market data prepared in %.2f seconds (symbols=%d, cache_hits=%d, downloaded=%d)",
-        time.perf_counter() - request_start,
+        "Market data cache %s (requested=%d, hits=%d, misses=%d, period=%s, interval=%s)",
+        "hit" if not missing_symbols else "partial-miss",
         len(sanitized_symbols),
         cache_hits,
         len(missing_symbols),
+        period,
+        interval,
     )
-    return {symbol: results.get(symbol, pd.DataFrame(columns=REQUIRED_COLUMNS)) for symbol in sanitized_symbols}
+
+    downloaded_results, download_seconds = _download_missing_symbols(missing_symbols, period, interval)
+    for symbol in missing_symbols:
+        symbol_frame = downloaded_results.get(symbol, pd.DataFrame(columns=REQUIRED_COLUMNS))
+        ttl_seconds = RAW_DATA_CACHE_TTL_SECONDS if not symbol_frame.empty else FAILED_DATA_CACHE_TTL_SECONDS
+        _set_cached_data(symbol, period, interval, symbol_frame, ttl_seconds=ttl_seconds)
+        results[symbol] = symbol_frame
+
+    final_results = {
+        symbol: results.get(symbol, pd.DataFrame(columns=REQUIRED_COLUMNS))
+        for symbol in sanitized_symbols
+    }
+    downloaded_successfully = sum(1 for symbol in missing_symbols if not final_results[symbol].empty)
+    skipped = sum(1 for symbol in sanitized_symbols if final_results[symbol].empty)
+    total_seconds = time.perf_counter() - request_start
+
+    logger.info(
+        "Market data prepared in %.2f seconds (requested=%d, cache_hits=%d, downloaded_successfully=%d, skipped=%d)",
+        total_seconds,
+        len(sanitized_symbols),
+        cache_hits,
+        downloaded_successfully,
+        skipped,
+    )
+
+    return BulkDownloadResult(
+        data=final_results,
+        stats=DownloadStats(
+            requested=len(sanitized_symbols),
+            cache_hits=cache_hits,
+            cache_misses=len(missing_symbols),
+            downloaded_successfully=downloaded_successfully,
+            skipped=skipped,
+        ),
+        download_seconds=download_seconds,
+        total_seconds=total_seconds,
+    )
+
+
+def load_daily_stock_data_bulk(
+    symbols: Iterable[str],
+    period: str = DEFAULT_PERIOD,
+    interval: str = DEFAULT_INTERVAL,
+) -> dict[str, pd.DataFrame]:
+    """Fetch daily stock data for many symbols with caching and batch download."""
+    return load_daily_stock_data_bulk_with_stats(symbols, period=period, interval=interval).data
 
 
 def load_daily_stock_data(
     symbol: str,
-    period: str = "1y",
-    interval: str = "1d",
+    period: str = DEFAULT_PERIOD,
+    interval: str = DEFAULT_INTERVAL,
 ) -> pd.DataFrame:
     """Fetch daily stock data for a single symbol."""
     return load_daily_stock_data_bulk([symbol], period=period, interval=interval).get(

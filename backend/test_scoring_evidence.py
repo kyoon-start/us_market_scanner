@@ -51,6 +51,20 @@ class ScoringEvidenceTests(unittest.TestCase):
             index=index,
         )
 
+    def _build_low_volume_frame(self) -> pd.DataFrame:
+        frame = self._build_strong_frame()
+        frame.loc[frame.index[-1], "Volume"] = 420_000.0
+        return frame
+
+    def _build_overextended_frame(self) -> pd.DataFrame:
+        frame = self._build_strong_frame()
+        prior_close = frame["Close"].iloc[-21]
+        frame.loc[frame.index[-20]:, "Close"] = np.linspace(prior_close * 1.02, prior_close * 1.32, 20)
+        frame["High"] = frame["Close"] * 1.01
+        frame["Low"] = frame["Close"] * 0.99
+        frame["Open"] = frame["Close"] * 0.995
+        return frame
+
     def test_indicators_include_stronger_evidence_fields(self) -> None:
         enriched = add_indicators(self._build_strong_frame())
         latest = enriched.iloc[-1]
@@ -105,6 +119,42 @@ class ScoringEvidenceTests(unittest.TestCase):
         recommendation = build_recommendation("TEST", enriched, enriched.iloc[-1])
 
         self.assertLessEqual(recommendation["long"]["score"], recommendation["swing"]["score"])
+
+    def test_low_volume_setup_is_heavily_penalized(self) -> None:
+        strong = add_indicators(self._build_strong_frame())
+        low_volume = add_indicators(self._build_low_volume_frame())
+
+        strong_recommendation = build_recommendation("STRONG", strong, strong.iloc[-1])
+        low_volume_recommendation = build_recommendation("LOWVOL", low_volume, low_volume.iloc[-1])
+        low_volume_reasons = " ".join(low_volume_recommendation["long"]["reason"])
+
+        self.assertLess(
+            low_volume_recommendation["swing"]["score"],
+            strong_recommendation["swing"]["score"] - 20,
+        )
+        self.assertLess(
+            low_volume_recommendation["long"]["score"],
+            strong_recommendation["long"]["score"] - 25,
+        )
+        self.assertIn("severely below normal", low_volume_reasons)
+
+    def test_overextended_20_day_setup_ranks_lower(self) -> None:
+        strong = add_indicators(self._build_strong_frame())
+        overextended = add_indicators(self._build_overextended_frame())
+
+        strong_recommendation = build_recommendation("STRONG", strong, strong.iloc[-1])
+        overextended_recommendation = build_recommendation("EXTENDED", overextended, overextended.iloc[-1])
+        overextended_long_reasons = " ".join(overextended_recommendation["long"]["reason"])
+
+        self.assertLess(
+            overextended_recommendation["swing"]["score"],
+            strong_recommendation["swing"]["score"],
+        )
+        self.assertLess(
+            overextended_recommendation["long"]["score"],
+            strong_recommendation["long"]["score"],
+        )
+        self.assertIn("far extended over 20 days", overextended_long_reasons)
 
 
 if __name__ == "__main__":
